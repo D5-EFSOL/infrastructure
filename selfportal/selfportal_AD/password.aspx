@@ -27,6 +27,7 @@
 <%@ Import Namespace="System.IO" %>
 <%@ Import Namespace="System.Security.Cryptography" %>
 <%@ Import Namespace="System.Threading" %>
+<%@ Import Namespace="System.Runtime.InteropServices" %>
 
 
 <script runat="server">
@@ -43,8 +44,6 @@
     // 0 = всегда. Рекомендуется 1-2, чтобы не мешать обычным
     // пользователям, но при этом ловить перебор.
     private const int CAPTCHA_THRESHOLD = 1;
-
-    private const int MIN_PASSWORD_LENGTH = 8;
 
     private const int MAX_USERNAME_LENGTH = 64;
 
@@ -182,6 +181,45 @@
             captchaRequired)
         {
             GenerateNewCaptcha();
+        }
+
+
+        /*
+         * Читаем доменную политику паролей и заполняем
+         * подсказку на форме + скрытые поля для клиентской
+         * динамической проверки.
+         *
+         * Читаем на каждом запросе (не только !IsPostBack),
+         * чтобы после postback подсказка не пропадала.
+         */
+
+        DomainPasswordPolicy policy =
+            ReadDomainPasswordPolicy();
+
+        if (policy != null)
+        {
+            lblPolicy.Text =
+                BuildPolicyDescription(policy);
+
+            hidMinLength.Value =
+                policy.MinLength.ToString();
+
+            hidComplexity.Value =
+                policy.ComplexityRequired
+                    ? "1"
+                    : "0";
+
+            pnlPolicy.Visible = true;
+        }
+        else
+        {
+            /*
+             * Политику прочитать не удалось (fail-open):
+             * подсказку не показываем, но смену пароля
+             * не блокируем.
+             */
+
+            pnlPolicy.Visible = false;
         }
     }
 
@@ -1221,57 +1259,334 @@
 
 
     // ============================================================
-    // PASSWORD POLICY
+    // DOMAIN PASSWORD POLICY (LDAP) — для отображения на форме
+    // ============================================================
+    //
+    // Читаем доменную политику паролей из атрибутов корневого объекта
+    // домена (minPwdLength и pwdProperties). Это ровно те атрибуты,
+    // которые PDC-эмулятор заполняет из Default Domain Policy при
+    // gpupdate — то есть источник истины для проверки сложности.
+    //
+    // Fail-open: если прочитать не удалось, политика считается
+    // неизвестной — подсказку не выводим, смену пароля не блокируем
+    // (реальную проверку всё равно выполнит ChangePassword).
+    // ============================================================
+
+    private const int DOMAIN_PASSWORD_COMPLEX = 0x00000001;
+
+    private class DomainPasswordPolicy
+    {
+        public int MinLength;
+        public bool ComplexityRequired;
+    }
+
+    private DomainPasswordPolicy ReadDomainPasswordPolicy()
+    {
+        try
+        {
+            using (
+                System.DirectoryServices.ActiveDirectory.Domain domain =
+                    System.DirectoryServices.ActiveDirectory.Domain.GetComputerDomain()
+            )
+            using (
+                DirectoryEntry domainEntry =
+                    domain.GetDirectoryEntry()
+            )
+            {
+                /*
+                 * minPwdLength — минимальная длина пароля.
+                 * pwdProperties — битовая маска; бит 0x1 = DOMAIN_PASSWORD_COMPLEX.
+                 */
+
+                int minLength = 0;
+
+                if (domainEntry.Properties.Contains("minPwdLength") &&
+                    domainEntry.Properties["minPwdLength"].Value != null)
+                {
+                    minLength =
+                        Convert.ToInt32(
+                            domainEntry.Properties["minPwdLength"].Value);
+                }
+
+                int props = 0;
+
+                if (domainEntry.Properties.Contains("pwdProperties") &&
+                    domainEntry.Properties["pwdProperties"].Value != null)
+                {
+                    props =
+                        Convert.ToInt32(
+                            domainEntry.Properties["pwdProperties"].Value);
+                }
+
+                DomainPasswordPolicy policy =
+                    new DomainPasswordPolicy();
+
+                policy.MinLength =
+                    minLength;
+
+                policy.ComplexityRequired =
+                    (props & DOMAIN_PASSWORD_COMPLEX) != 0;
+
+                return policy;
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string BuildPolicyDescription(
+        DomainPasswordPolicy policy)
+    {
+        string text;
+
+        if (policy.MinLength > 0)
+        {
+            text =
+                "Пароль должен быть не менее " +
+                policy.MinLength +
+                " символов";
+        }
+        else
+        {
+            text =
+                "Пароль должен соответствовать " +
+                "требованиям политики безопасности";
+        }
+
+        if (policy.ComplexityRequired)
+        {
+            text +=
+                " и содержать символы трёх из четырёх " +
+                "категорий: заглавные буквы, строчные буквы, " +
+                "цифры, специальные символы";
+        }
+
+        text += ".";
+
+        return text;
+    }
+
+
+    // ============================================================
+    // PASSWORD POLICY (NetValidatePasswordPolicy)
+    // ============================================================
+    //
+    // Проверяем сложность/длину нового пароля по РЕАЛЬНОЙ политике,
+    // а не по захардкоженному набору правил:
+    //
+    //   локальная версия -> политика ЛОКАЛЬНОЙ машины (ServerName = null);
+    //   доменная версия  -> политика ДОМЕНА (ServerName = "\\<домен>").
+    //
+    // Используем NetValidatePasswordPolicy с типом NetValidatePasswordReset:
+    // он валидирует длину и сложность по эффективной политике без старого
+    // пароля и персистентных полей. Историю и минимальный возраст на этом
+    // этапе не проверяем — их в любом случае проверит сам ChangePassword
+    // в WinNT-провайдере. Здесь цель — дать пользователю точную причину
+    // отказа до обращения к каталогу.
+    // ============================================================
+
+    private const uint NERR_PasswordTooShort = 2245;
+    private const uint NERR_PasswordTooLong = 2703;
+    private const uint NERR_PasswordNotComplexEnough = 2704;
+
+    private const int NetValidatePasswordReset = 3;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME
+    {
+        public uint dwLowDateTime;
+        public uint dwHighDateTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NET_VALIDATE_PASSWORD_HASH
+    {
+        public uint Length;
+        public IntPtr Hash;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NET_VALIDATE_PERSISTED_FIELDS
+    {
+        public uint PresentFields;
+        public FILETIME PasswordLastSet;
+        public FILETIME BadPasswordTime;
+        public FILETIME LockoutTime;
+        public uint BadPasswordCount;
+        public uint PasswordHistoryLength;
+        public IntPtr PasswordHistory;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NET_VALIDATE_PASSWORD_RESET_INPUT_ARG
+    {
+        public NET_VALIDATE_PERSISTED_FIELDS InputPersistedFields;
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string ClearPassword;
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string UserAccountName;
+        public NET_VALIDATE_PASSWORD_HASH HashedPassword;
+        [MarshalAs(UnmanagedType.U1)]
+        public bool PasswordMustChangeAtNextLogon;
+        [MarshalAs(UnmanagedType.U1)]
+        public bool ClearLockout;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NET_VALIDATE_OUTPUT_ARG
+    {
+        public NET_VALIDATE_PERSISTED_FIELDS ChangedPersistedFields;
+        public uint ValidationStatus;
+    }
+
+    [DllImport("netapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint NetValidatePasswordPolicy(
+        [MarshalAs(UnmanagedType.LPWStr)] string ServerName,
+        IntPtr Qualifier,
+        int ValidationType,
+        IntPtr InputArg,
+        out IntPtr OutputArg);
+
+    [DllImport("netapi32.dll")]
+    private static extern uint NetApiBufferFree(IntPtr Buffer);
+
+    // ============================================================
+    // GET POLICY SERVER NAME
+    // ============================================================
+    //
+    // "\\<домен>" -> читается политика ДОМЕНА (Default Domain Policy /
+    // Fine-Grained Password Policy). NetBIOS-имя домена определяется
+    // через GetNetbiosDomainName().
+    // ============================================================
+
+    private string GetPolicyServerName()
+    {
+        return "\\\\" + GetNetbiosDomainName();
+    }
+
+    // ============================================================
+    // IS PASSWORD STRONG (по реальной политике)
+    // ============================================================
+    //
+    // Возвращает:
+    //   true  — пароль проходит по политике (или политику не удалось
+    //           проверить — тогда окончательное решение примет сам
+    //           ChangePassword);
+    //   false — пароль нарушает длину/сложность, причина в out reason.
     // ============================================================
 
     private bool IsPasswordStrong(
-        string password)
+        string password,
+        out string reason)
     {
+        reason = null;
+
         if (String.IsNullOrEmpty(password))
         {
+            reason = "Пароль не может быть пустым.";
             return false;
         }
 
+        string serverName =
+            GetPolicyServerName();
 
-        if (password.Length <
-            MIN_PASSWORD_LENGTH)
+        IntPtr inputPtr = IntPtr.Zero;
+        IntPtr outputPtr = IntPtr.Zero;
+
+        try
         {
-            return false;
+            NET_VALIDATE_PASSWORD_RESET_INPUT_ARG input =
+                new NET_VALIDATE_PASSWORD_RESET_INPUT_ARG();
+
+            input.ClearPassword = password;
+
+            /*
+             * UserAccountName оставляем пустым: для проверки длины
+             * и сложности имя учётной записи не требуется.
+             */
+
+            inputPtr = Marshal.AllocHGlobal(
+                Marshal.SizeOf(typeof(
+                    NET_VALIDATE_PASSWORD_RESET_INPUT_ARG)));
+
+            Marshal.StructureToPtr(
+                input,
+                inputPtr,
+                false);
+
+            uint rc = NetValidatePasswordPolicy(
+                serverName,
+                IntPtr.Zero,
+                NetValidatePasswordReset,
+                inputPtr,
+                out outputPtr);
+
+            /*
+             * rc != 0 — ошибка вызова, OutputArg == NULL.
+             * Не блокируем смену: точную проверку выполнит
+             * сам ChangePassword.
+             */
+
+            if (rc != 0)
+            {
+                return true;
+            }
+
+            NET_VALIDATE_OUTPUT_ARG output =
+                (NET_VALIDATE_OUTPUT_ARG)Marshal.PtrToStructure(
+                    outputPtr,
+                    typeof(NET_VALIDATE_OUTPUT_ARG));
+
+            switch (output.ValidationStatus)
+            {
+                case 0: // NERR_Success
+                    return true;
+
+                case NERR_PasswordTooShort:
+                    reason =
+                        "Пароль короче минимума, заданного политикой.";
+                    return false;
+
+                case NERR_PasswordTooLong:
+                    reason =
+                        "Пароль длиннее максимума, заданного политикой.";
+                    return false;
+
+                case NERR_PasswordNotComplexEnough:
+                    reason =
+                        "Пароль не соответствует требованиям сложности.";
+                    return false;
+
+                default:
+                    /*
+                     * Любая иная причина — не блокируем на этом этапе,
+                     * точный разбор выполнит ChangePassword.
+                     */
+                    return true;
+            }
         }
+        catch
+        {
+            /*
+             * Ошибка маршаллинга или вызова P/Invoke — не блокируем
+             * смену пароля, решение примет ChangePassword.
+             */
+            return true;
+        }
+        finally
+        {
+            if (inputPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(inputPtr);
+            }
 
-
-        bool upper =
-            Regex.IsMatch(
-                password,
-                @"[A-ZА-ЯЁ]"
-            );
-
-
-        bool lower =
-            Regex.IsMatch(
-                password,
-                @"[a-zа-яё]"
-            );
-
-
-        bool digit =
-            Regex.IsMatch(
-                password,
-                @"[0-9]"
-            );
-
-
-        bool special =
-            Regex.IsMatch(
-                password,
-                @"[\W_]"
-            );
-
-
-        return upper &&
-               lower &&
-               digit &&
-               special;
+            if (outputPtr != IntPtr.Zero)
+            {
+                NetApiBufferFree(outputPtr);
+            }
+        }
     }
 
 
@@ -1576,16 +1891,14 @@
         // Проверяем сложность нового пароля
         // --------------------------------------------------------
 
+        string policyReason;
+
         if (!IsPasswordStrong(
-            newPassword))
+            newPassword,
+            out policyReason))
         {
             ShowError(
-                "Новый пароль должен содержать " +
-                "минимум " +
-                MIN_PASSWORD_LENGTH +
-                " символов и включать " +
-                "заглавные и строчные буквы, " +
-                "цифры и специальный символ."
+                policyReason
             );
 
 
@@ -2156,6 +2469,217 @@
                 1.5;
         }
 
+
+        /* --- Политика сложности и проверка пароля --- */
+
+        .policy-hint {
+            margin-bottom:
+                8px;
+
+            padding:
+                8px 12px;
+
+            background:
+                #eef6fd;
+
+            border-left:
+                3px solid #0072c6;
+
+            color:
+                #333;
+
+            font-size:
+                13px;
+
+            line-height:
+                1.5;
+
+            border-radius:
+                4px;
+        }
+
+
+        .pwd-wrap {
+            position:
+                relative;
+        }
+
+
+        .pwd-wrap input {
+            padding-right:
+                44px;
+        }
+
+
+        .pwd-toggle {
+            position:
+                absolute;
+
+            top:
+                50%;
+
+            right:
+                8px;
+
+            transform:
+                translateY(-50%);
+
+            border:
+                none;
+
+            background:
+                transparent;
+
+            cursor:
+                pointer;
+
+            padding:
+                4px;
+
+            color:
+                #666;
+
+            display:
+                inline-flex;
+
+            align-items:
+                center;
+
+            justify-content:
+                center;
+        }
+
+
+        .pwd-toggle:hover {
+            color:
+                #0072c6;
+        }
+
+
+        .pwd-toggle .eye-closed {
+            display:
+                none;
+        }
+
+
+        .pwd-toggle.showing .eye-open {
+            display:
+                none;
+        }
+
+
+        .pwd-toggle.showing .eye-closed {
+            display:
+                inline;
+        }
+
+
+        .pwd-requirements {
+            margin-top:
+                8px;
+
+            font-size:
+                13px;
+        }
+
+
+        .pwd-meter {
+            height:
+                6px;
+
+            background:
+                #e0e0e0;
+
+            border-radius:
+                3px;
+
+            overflow:
+                hidden;
+
+            margin-bottom:
+                10px;
+        }
+
+
+        .pwd-meter-bar {
+            height:
+                100%;
+
+            width:
+                0%;
+
+            background:
+                #c62828;
+
+            transition:
+                width 0.2s ease,
+                background-color 0.2s ease;
+
+            border-radius:
+                3px;
+        }
+
+
+        .pwd-checks {
+            list-style:
+                none;
+
+            margin:
+                0;
+
+            padding:
+                0;
+        }
+
+
+        .pwd-checks li {
+            padding-left:
+                22px;
+
+            position:
+                relative;
+
+            margin-bottom:
+                4px;
+
+            color:
+                #888;
+        }
+
+
+        .pwd-checks li::before {
+            content:
+                "✕";
+
+            position:
+                absolute;
+
+            left:
+                2px;
+
+            color:
+                #c62828;
+
+            font-weight:
+                bold;
+        }
+
+
+        .pwd-checks li.ok {
+            color:
+                #2e7d32;
+        }
+
+
+        .pwd-checks li.ok::before {
+            content:
+                "✓";
+
+            color:
+                #2e7d32;
+        }
+
+
     </style>
 
 </head>
@@ -2223,12 +2747,47 @@
             </label>
 
 
-            <asp:TextBox
-                ID="txtCurrentPassword"
-                runat="server"
-                TextMode="Password"
-                autocomplete="current-password"
-            />
+            <div class="pwd-wrap">
+
+                <asp:TextBox
+                    ID="txtCurrentPassword"
+                    runat="server"
+                    TextMode="Password"
+                    autocomplete="current-password"
+                />
+
+                <button
+                    type="button"
+                    class="pwd-toggle"
+                    aria-label="Показать пароль"
+                >
+                    <svg
+                        class="eye-open"
+                        viewBox="0 0 24 24"
+                        width="20"
+                        height="20"
+                        aria-hidden="true"
+                    >
+                        <path
+                            fill="currentColor"
+                            d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"
+                        />
+                    </svg>
+                    <svg
+                        class="eye-closed"
+                        viewBox="0 0 24 24"
+                        width="20"
+                        height="20"
+                        aria-hidden="true"
+                    >
+                        <path
+                            fill="currentColor"
+                            d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"
+                        />
+                    </svg>
+                </button>
+
+            </div>
 
         </div>
 
@@ -2244,12 +2803,80 @@
             </label>
 
 
-            <asp:TextBox
-                ID="txtNewPassword"
+            <!-- Подсказка о политике сложности (заполняется с сервера) -->
+            <asp:Panel
+                ID="pnlPolicy"
                 runat="server"
-                TextMode="Password"
-                autocomplete="new-password"
-            />
+                Visible="false"
+                CssClass="policy-hint"
+            >
+                <asp:Label
+                    ID="lblPolicy"
+                    runat="server"
+                />
+            </asp:Panel>
+
+
+            <div class="pwd-wrap">
+
+                <asp:TextBox
+                    ID="txtNewPassword"
+                    runat="server"
+                    TextMode="Password"
+                    autocomplete="new-password"
+                />
+
+                <button
+                    type="button"
+                    class="pwd-toggle"
+                    aria-label="Показать пароль"
+                >
+                    <svg
+                        class="eye-open"
+                        viewBox="0 0 24 24"
+                        width="20"
+                        height="20"
+                        aria-hidden="true"
+                    >
+                        <path
+                            fill="currentColor"
+                            d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"
+                        />
+                    </svg>
+                    <svg
+                        class="eye-closed"
+                        viewBox="0 0 24 24"
+                        width="20"
+                        height="20"
+                        aria-hidden="true"
+                    >
+                        <path
+                            fill="currentColor"
+                            d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"
+                        />
+                    </svg>
+                </button>
+
+            </div>
+
+
+            <!-- Динамическая проверка политики (заполняется через selfportal.js) -->
+            <div
+                class="pwd-requirements"
+                id="pwdRequirements"
+                style="display: none;"
+            >
+                <div class="pwd-meter">
+                    <div class="pwd-meter-bar" id="pwdMeterBar"></div>
+                </div>
+                <ul class="pwd-checks" id="pwdChecks">
+                    <li data-check="length">Минимальная длина</li>
+                    <li data-check="upper">Заглавная буква</li>
+                    <li data-check="lower">Строчная буква</li>
+                    <li data-check="digit">Цифра</li>
+                    <li data-check="special">Специальный символ</li>
+                </ul>
+            </div>
 
         </div>
 
@@ -2265,12 +2892,47 @@
             </label>
 
 
-            <asp:TextBox
-                ID="txtConfirmPassword"
-                runat="server"
-                TextMode="Password"
-                autocomplete="new-password"
-            />
+            <div class="pwd-wrap">
+
+                <asp:TextBox
+                    ID="txtConfirmPassword"
+                    runat="server"
+                    TextMode="Password"
+                    autocomplete="new-password"
+                />
+
+                <button
+                    type="button"
+                    class="pwd-toggle"
+                    aria-label="Показать пароль"
+                >
+                    <svg
+                        class="eye-open"
+                        viewBox="0 0 24 24"
+                        width="20"
+                        height="20"
+                        aria-hidden="true"
+                    >
+                        <path
+                            fill="currentColor"
+                            d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"
+                        />
+                    </svg>
+                    <svg
+                        class="eye-closed"
+                        viewBox="0 0 24 24"
+                        width="20"
+                        height="20"
+                        aria-hidden="true"
+                    >
+                        <path
+                            fill="currentColor"
+                            d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"
+                        />
+                    </svg>
+                </button>
+
+            </div>
 
         </div>
 
@@ -2370,9 +3032,28 @@
     </div>
 
 
+    <!-- Скрытые поля политики для клиентской динамической проверки -->
+    <asp:HiddenField
+        ID="hidMinLength"
+        runat="server"
+        Value="0"
+    />
+    <asp:HiddenField
+        ID="hidComplexity"
+        runat="server"
+        Value="0"
+    />
+
+
 </div>
 
 </form>
+
+
+<script
+    src="selfportal.js"
+    defer
+></script>
 
 </body>
 

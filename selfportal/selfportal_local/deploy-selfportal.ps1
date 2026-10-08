@@ -2,32 +2,39 @@
 # SelfPortal — развёртывание на IIS
 # ============================================================
 # Создаёт каталог C:\inetpub\wwwroot\SelfPortal, копирует туда
-# password.aspx и web.config (лежат рядом со скриптом), создаёт
-# пул приложений SelfPortal (учётка NetworkService) и приложение
-# IIS, указывающее на этот каталог.
+# password.aspx, web.config и selfportal.js (лежат рядом со скриптом),
+# создаёт пул приложений SelfPortal (учётка NetworkService) и
+# приложение IIS, указывающее на этот каталог.
 #
 # Запуск: от имени администратора (скрипт сам перезапустит себя
 # с повышением прав, если запущен без них).
+#
+# Параметры командной строки (необязательные):
+#   .\deploy-selfportal.ps1 -ClientName detpit-as -Port 43445
+# Если параметры не заданы, используются значения по умолчанию ниже.
 # ============================================================
 
-# --- Параметры (при необходимости поменяйте здесь) ------------
+# --- Параметры -------------------------------------------------
+param(
+    [string]$ClientName = "client_name",   # имя клиента для итогового URL
+    [string]$Port       = "port"           # порт (замените на реальный)
+)
+
 $SiteName      = "Default Web Site"   # сайт IIS, к которому привязываем приложение
 $AppName       = "SelfPortal"         # имя приложения (путь в URL)
 $AppPoolName   = "SelfPortal"         # имя пула приложений
 $AppPoolUser   = "NetworkService"     # учётная запись пула
 $TargetDir     = "C:\inetpub\wwwroot\SelfPortal"
-$ClientName    = "client_name"        # имя клиента для итогового URL
-$Port          = "port"              # порт (замените на реальный)
 # --------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
 
 # --- Самоповышение прав до администратора ---------------------
+# Пробрасываем параметры при перезапуске с повышением прав.
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Требуются права администратора. Перезапуск с повышением..." -ForegroundColor Yellow
-    Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" `
-        -Verb RunAs
+    $args = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ClientName `"$ClientName`" -Port `"$Port`""
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $args -Verb RunAs
     exit
 }
 
@@ -61,7 +68,7 @@ if (-not (Test-Path $TargetDir)) {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-foreach ($f in @("password.aspx", "web.config")) {
+foreach ($f in @("password.aspx", "web.config", "selfportal.js")) {
     $src = Join-Path $scriptDir $f
     if (-not (Test-Path $src)) {
         Write-Host "ОШИБКА: не найден файл $src" -ForegroundColor Red
@@ -89,7 +96,14 @@ Set-ItemProperty -Path "IIS:\AppPools\$AppPoolName" -Name processModel.identityT
 Set-ItemProperty -Path "IIS:\AppPools\$AppPoolName" -Name managedRuntimeVersion -Value "v4.0"
 Set-ItemProperty -Path "IIS:\AppPools\$AppPoolName" -Name managedPipelineMode -Value "Integrated"
 
-Step "Пул $AppPoolName настроен (NetworkService, .NET 4.0, Integrated)."
+# Отключаем рециклинг пула, чтобы счётчики блокировок и CAPTCHA
+# (хранятся в MemoryCache, в памяти процесса) не сбрасывались.
+# По умолчанию IIS ресайклит пул при idle 20 минут и раз в 29 часов,
+# что обнуляет блокировки раньше их истечения (30 минут).
+Set-ItemProperty -Path "IIS:\AppPools\$AppPoolName" -Name processModel.idleTimeout -Value "00:00:00"
+Set-ItemProperty -Path "IIS:\AppPools\$AppPoolName" -Name recycling.periodicRestart.time -Value "00:00:00"
+
+Step "Пул $AppPoolName настроен (NetworkService, .NET 4.0, Integrated, recycle отключён)."
 
 # --- 4. Создание приложения IIS ------------------------------
 Step "Создание приложения /$AppName на сайте $SiteName ..."

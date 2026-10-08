@@ -62,9 +62,22 @@ WinNT://./<имя_пользователя>,user → ChangePassword(старый
 |---|---|
 | `password.aspx` | Страница смены пароля (вся логика в inline-коде) |
 | `web.config` | Заголовки безопасности, Secure cookie, скрытие версий |
+| `selfportal.js` | Клиентская логика: «глазок» и динамическая проверка пароля |
 | `deploy-selfportal.ps1` | Скрипт развёртывания на IIS |
 
 > Кодировка: `password.aspx` и `deploy-selfportal.ps1` — **UTF-8 с BOM**
 > (обязательно для Windows PowerShell 5.1 и ASP.NET).
 
-Подробная инструкция по развёртыванию и настройке мониторинга — в `DEPLOYMENT.md`.
+## Развёртывание
+
+Скопируйте три файла (`password.aspx`, `web.config`, `selfportal.js`) и
+`deploy-selfportal.ps1` на сервер в одну папку, откройте PowerShell от имени
+администратора и выполните:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\deploy-selfportal.ps1 -ClientName <имя-клиента> -Port <порт>
+```
+
+Параметры `-ClientName` и `-Port` необязательны (влияют только на текст
+итогового URL). Подробности — в общем `README.md` в корне `selfportal/`.
