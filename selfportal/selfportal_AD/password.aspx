@@ -2680,6 +2680,49 @@
         }
 
 
+        .pwd-mismatch {
+            margin-top:
+                6px;
+
+            padding:
+                6px 10px;
+
+            background:
+                #fdecea;
+
+            border-left:
+                3px solid #c62828;
+
+            color:
+                #c62828;
+
+            font-size:
+                13px;
+
+            border-radius:
+                4px;
+        }
+
+
+        input.input-error {
+            border-color:
+                #c62828;
+
+            box-shadow:
+                0 0 0 2px
+                rgba(198,40,40,0.15);
+        }
+
+
+        .btn:disabled {
+            background:
+                #a0a0a0;
+
+            cursor:
+                not-allowed;
+        }
+
+
     </style>
 
 </head>
@@ -2932,6 +2975,16 @@
                     </svg>
                 </button>
 
+            </div>
+
+
+            <!-- Ошибка: пароли не совпадают (заполняется через selfportal.js) -->
+            <div
+                class="pwd-mismatch"
+                id="pwdMismatch"
+                style="display: none;"
+            >
+                Пароли не совпадают.
             </div>
 
         </div>

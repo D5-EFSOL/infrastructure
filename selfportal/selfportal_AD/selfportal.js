@@ -1,13 +1,18 @@
 /* ============================================================
- * SelfPortal — клиентская логика (глазок + динамическая проверка)
+ * SelfPortal — клиентская логика
+ *   - «глазок» (показать/скрыть пароль)
+ *   - динамическая проверка нового пароля (шкала + чек-лист)
+ *   - проверка совпадения повтора пароля с подсветкой ошибки
+ *   - блокировка кнопки до корректного заполнения всех полей
  *
  * Вся логика вынесена во внешний файл, т.к. CSP запрещает
  * inline-скрипты (script-src 'self').
  *
  * Работает с серверными полями (ClientID без префиксов, т.к.
  * Panel не является naming container):
- *   txtCurrentPassword, txtNewPassword, txtConfirmPassword,
- *   hidMinLength, hidComplexity
+ *   txtUsername, txtCurrentPassword, txtNewPassword,
+ *   txtConfirmPassword, txtCaptcha,
+ *   hidMinLength, hidComplexity, btnChange
  * ============================================================ */
 
 (function () {
@@ -52,13 +57,7 @@
     }
 
     /* ----------------------------------------------------------
-     * 2. Динамическая проверка нового пароля
-     * ----------------------------------------------------------
-     *
-     * Проверяем только то, что реально задано политикой:
-     *   - минимальную длину (hidMinLength > 0);
-     *   - сложность (hidComplexity == "1") — три из четырёх
-     *     категорий, как требует Windows.
+     * 2. Политика паролей
      * ---------------------------------------------------------- */
 
     function getMinLength() {
@@ -69,31 +68,53 @@
 
     function getComplexityRequired() {
         var el = $("hidComplexity");
-        return el && el.value === "1";
+        return !!el && el.value === "1";
     }
+
+    /* Число категорий символов, присутствующих в пароле (0..4). */
+    function countCategories(value) {
+        var n = 0;
+        if (/[A-ZА-ЯЁ]/.test(value)) { n++; }
+        if (/[a-zа-яё]/.test(value)) { n++; }
+        if (/[0-9]/.test(value)) { n++; }
+        if (/[\W_]/.test(value)) { n++; }
+        return n;
+    }
+
+    /* Соответствует ли пароль политике (длина + сложность). */
+    function isNewPasswordValid(value) {
+        if (!value) {
+            return false;
+        }
+
+        var minLength = getMinLength();
+        if (minLength > 0 && value.length < minLength) {
+            return false;
+        }
+
+        if (getComplexityRequired() && countCategories(value) < 3) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /* ----------------------------------------------------------
+     * 3. Динамическая проверка нового пароля (шкала + чек-лист)
+     * ---------------------------------------------------------- */
 
     function checkPassword(value) {
         var minLength = getMinLength();
         var complex = getComplexityRequired();
 
-        var checks = {
+        return {
             length: !minLength || value.length >= minLength,
-            upper: !complex || /[A-ZА-ЯЁ]/.test(value),
-            lower: !complex || /[a-zа-яё]/.test(value),
-            digit: !complex || /[0-9]/.test(value),
-            special: !complex || /[\W_]/.test(value)
+            upper: /[A-ZА-ЯЁ]/.test(value),
+            lower: /[a-zа-яё]/.test(value),
+            digit: /[0-9]/.test(value),
+            special: /[\W_]/.test(value),
+            complex: !complex || countCategories(value) >= 3
         };
-
-        /* Для сложности Windows достаточно 3 категорий из 4. */
-        var categories = 0;
-        if (/[A-ZА-ЯЁ]/.test(value)) { categories++; }
-        if (/[a-zа-яё]/.test(value)) { categories++; }
-        if (/[0-9]/.test(value)) { categories++; }
-        if (/[\W_]/.test(value)) { categories++; }
-
-        checks.complex = !complex || categories >= 3;
-
-        return checks;
     }
 
     function countPassed(checks) {
@@ -160,8 +181,6 @@
 
             if (kind === "length") {
                 ok = checks.length;
-            } else if (kind === "complex") {
-                ok = checks.complex;
             } else if (complex) {
                 /* Отдельные категории показываем только при сложности */
                 ok = checks[kind];
@@ -181,7 +200,7 @@
         }
     }
 
-    function onNewPasswordInput() {
+    function refreshPasswordMeter() {
         var input = $("txtNewPassword");
         var req = $("pwdRequirements");
 
@@ -206,18 +225,115 @@
         updateCheckList(value, checks);
     }
 
-    function initPasswordCheck() {
-        var input = $("txtNewPassword");
+    /* ----------------------------------------------------------
+     * 4. Проверка совпадения повтора пароля
+     * ---------------------------------------------------------- */
 
-        if (!input) {
+    function refreshConfirmState() {
+        var newInput = $("txtNewPassword");
+        var confirmInput = $("txtConfirmPassword");
+        var mismatch = $("pwdMismatch");
+
+        if (!newInput || !confirmInput) {
             return;
         }
 
-        input.addEventListener("input", onNewPasswordInput);
+        var confirmValue = confirmInput.value;
+
+        /* Пока поле подтверждения пустое — ошибку не показываем. */
+        if (confirmValue.length === 0) {
+            if (mismatch) { mismatch.style.display = "none"; }
+            confirmInput.classList.remove("input-error");
+            return;
+        }
+
+        var match = (confirmValue === newInput.value);
+
+        if (match) {
+            if (mismatch) { mismatch.style.display = "none"; }
+            confirmInput.classList.remove("input-error");
+        } else {
+            if (mismatch) { mismatch.style.display = "block"; }
+            confirmInput.classList.add("input-error");
+        }
     }
 
     /* ----------------------------------------------------------
-     * Инициализация после загрузки DOM (скрипт подключён с defer)
+     * 5. Блокировка кнопки до корректного заполнения
+     * ---------------------------------------------------------- */
+
+    function captchaVisibleAndRequired() {
+        var input = $("txtCaptcha");
+        return !!input && input.offsetParent !== null;
+    }
+
+    function validateForm() {
+        var btn = $("btnChange");
+        if (!btn) {
+            return;
+        }
+
+        var username = $("txtUsername");
+        var current = $("txtCurrentPassword");
+        var newInput = $("txtNewPassword");
+        var confirm = $("txtConfirmPassword");
+
+        var ok = true;
+
+        if (!username || username.value.trim().length === 0) { ok = false; }
+        if (!current || current.value.length === 0) { ok = false; }
+        if (!newInput || !isNewPasswordValid(newInput.value)) { ok = false; }
+        if (!confirm || confirm.value.length === 0 || confirm.value !== newInput.value) { ok = false; }
+        if (captchaVisibleAndRequired()) {
+            var captcha = $("txtCaptcha");
+            if (!captcha || captcha.value.trim().length === 0) { ok = false; }
+        }
+
+        btn.disabled = !ok;
+    }
+
+    /* ----------------------------------------------------------
+     * 6. Инициализация
+     * ---------------------------------------------------------- */
+
+    function initPasswordCheck() {
+        var newInput = $("txtNewPassword");
+        var confirm = $("txtConfirmPassword");
+
+        if (newInput) {
+            newInput.addEventListener("input", refreshPasswordMeter);
+            newInput.addEventListener("input", refreshConfirmState);
+            newInput.addEventListener("input", validateForm);
+        }
+
+        if (confirm) {
+            confirm.addEventListener("input", refreshConfirmState);
+            confirm.addEventListener("input", validateForm);
+        }
+
+        var username = $("txtUsername");
+        if (username) {
+            username.addEventListener("input", validateForm);
+        }
+
+        var current = $("txtCurrentPassword");
+        if (current) {
+            current.addEventListener("input", validateForm);
+        }
+
+        var captcha = $("txtCaptcha");
+        if (captcha) {
+            captcha.addEventListener("input", validateForm);
+        }
+
+        /* Начальное состояние: сброс и блокировка кнопки. */
+        refreshPasswordMeter();
+        refreshConfirmState();
+        validateForm();
+    }
+
+    /* ----------------------------------------------------------
+     * Запуск после загрузки DOM (скрипт подключён с defer)
      * ---------------------------------------------------------- */
 
     initEyeToggles();
