@@ -71,6 +71,43 @@ Step "Сервер входит в домен: $($computerSystem.Domain)"
 Step "Импорт модуля WebAdministration..."
 Import-Module WebAdministration -ErrorAction Stop
 
+# --- 1.0 Проверка и установка ASP.NET --------------------------
+# Без ASP.NET IIS не обрабатывает .aspx: статические файлы (selfportal.js)
+# отдаются, а password.aspx возвращает 404 (404.3). Типично для RDS Gateway,
+# где установлена только роль RDS без компонента ASP.NET. Проверяем и
+# устанавливаем при необходимости ДО создания приложения.
+function Install-AspNet {
+    # Windows Server — Install-WindowsFeature / Add-WindowsFeature
+    if (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue) {
+        Install-WindowsFeature -Name Web-Asp-Net45 -IncludeManagementTools | Out-Null
+        return
+    }
+    if (Get-Command Add-WindowsFeature -ErrorAction SilentlyContinue) {
+        Add-WindowsFeature -Name Web-Asp-Net45 | Out-Null
+        return
+    }
+    # Клиентская ОС (Windows 10/11) — DISM
+    dism.exe /online /Enable-Feature /FeatureName:IIS-ASPNET45 /all /norestart | Out-Null
+}
+
+Step "Проверка ASP.NET (Web-Asp-Net45)..."
+$asp = Get-WindowsFeature -Name Web-Asp-Net45 -ErrorAction SilentlyContinue
+if ($null -ne $asp -and $asp.InstallState -eq "Installed") {
+    Step "ASP.NET 4.5+ уже установлен."
+} else {
+    Step "ASP.NET не установлен — устанавливаю..."
+    Install-AspNet
+    $asp = Get-WindowsFeature -Name Web-Asp-Net45 -ErrorAction SilentlyContinue
+    if ($null -eq $asp -or $asp.InstallState -ne "Installed") {
+        Write-Host "ОШИБКА: не удалось установить ASP.NET. Проверьте роль вручную." -ForegroundColor Red
+        Read-Host "Нажмите любую клавишу для выхода"
+        exit 1
+    }
+    Step "ASP.NET установлен. Перезапуск IIS..."
+    iisreset | Out-Null
+    Step "IIS перезапущен."
+}
+
 # --- 1.1 Регистрация источника Event Log ----------------------
 # Источник "RDWebPassChange" должен существовать, иначе
 # EventLog.WriteEntry() в приложении не сможет писать события
