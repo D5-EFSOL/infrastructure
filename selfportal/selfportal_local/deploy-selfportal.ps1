@@ -53,18 +53,14 @@ Import-Module WebAdministration -ErrorAction Stop
 # отдаются, а password.aspx возвращает 404 (404.3). Типично для RDS Gateway,
 # где установлена только роль RDS без компонента ASP.NET. Проверяем и
 # устанавливаем при необходимости ДО создания приложения.
+# Развёртывание только на Windows Server.
 function Install-AspNet {
     # Windows Server — Install-WindowsFeature / Add-WindowsFeature
     if (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue) {
         Install-WindowsFeature -Name Web-Asp-Net45 -IncludeManagementTools | Out-Null
         return
     }
-    if (Get-Command Add-WindowsFeature -ErrorAction SilentlyContinue) {
-        Add-WindowsFeature -Name Web-Asp-Net45 | Out-Null
-        return
-    }
-    # Клиентская ОС (Windows 10/11) — DISM
-    dism.exe /online /Enable-Feature /FeatureName:IIS-ASPNET45 /all /norestart | Out-Null
+    Add-WindowsFeature -Name Web-Asp-Net45 | Out-Null
 }
 
 Step "Проверка ASP.NET (Web-Asp-Net45)..."
@@ -80,9 +76,7 @@ if ($null -ne $asp -and $asp.InstallState -eq "Installed") {
         Read-Host "Нажмите любую клавишу для выхода"
         exit 1
     }
-    Step "ASP.NET установлен. Перезапуск IIS..."
-    iisreset | Out-Null
-    Step "IIS перезапущен."
+    Step "ASP.NET установлен."
 }
 
 # --- 1.1 Регистрация источника Event Log ----------------------
